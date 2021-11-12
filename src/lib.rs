@@ -147,6 +147,18 @@ pub struct MMC_CMD {
     blocksize: u32,
 }
 impl MMC_CMD {
+    pub fn new() -> Self {
+        Self{
+            cmdidx: 0,
+            cmdarg: 0,
+            resptype: MmcResp::MMC_RSP_R1,
+            resp0: [0;4],
+            resp1: 0,
+            flags: MmcFlags::MMC_DATA_NONE,
+            blocks: 0,
+            blocksize: 0,
+        }
+    }
     pub unsafe fn send(&mut self, data: bool) {
         println!("\n[CMD] SEND CMD {}", self.cmdidx & 0x3F);
         let mut cmdval = 0x8000_0000u32;
@@ -1139,6 +1151,30 @@ mod serial {
         }
     }
 }
+
+pub struct Card{
+    pub cmd:MMC_CMD
+}
+lazy_static::lazy_static! {
+    pub static ref SD_CARD:Mutex<Option<Box<Card>>> = Mutex::new(Some(Box::new(Card { cmd: MMC_CMD::new() })));
+}
+
+impl Card{
+    pub fn read_blocks(&mut self, start: u32, blkcnt: u32,buf: &[u8]){
+        self.cmd.resp1 = buf.as_ptr() as *const _ as usize;
+        unsafe{
+            self.cmd.read_block(start, blkcnt);
+        }
+        
+    }
+    pub fn write_blocks(&mut self, start: u32, blkcnt: u32,buf: &[u8]){
+        self.cmd.resp1 = buf.as_ptr() as *const _ as usize;
+        unsafe{
+            self.cmd.write_block(start, blkcnt);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
