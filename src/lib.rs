@@ -1,5 +1,4 @@
 #![no_std]
-#![no_main]
 #![feature(asm)]
 extern crate alloc;
 use crate::{
@@ -8,42 +7,64 @@ use crate::{
 };
 use alloc::boxed::Box;
 use bitflags::bitflags;
-use core::fmt::{self, Error};
+use generic::{SHMC, shmc};
+use core::fmt;
 use embedded_hal::prelude::_embedded_hal_serial_Write;
-use fat32::volume::Volume;
+use peripheral::Timer;
 use serial::Serial;
 use spin::Mutex;
-
 const GPIO_BASE: usize = 0x02000000;
 const PF_CFG0: usize = 0xF0;
-const PF_DAT: usize = 0x100;
 const PF_DRV0: usize = 0x104;
 const PF_PULL0: usize = 0x114;
 
-const hclkbase: usize = 0x2001000 + 0x84c;
-const mclkbase: usize = 0x2001000 + 0x830;
+const HCLKBASE: usize = 0x2001000 + 0x84c;
+const MCLKBASE: usize = 0x2001000 + 0x830;
 
 pub const SHMC_BASE: usize = 0x04020000;
 const gctrl: usize = 0x0;
 const clkcr: usize = 0x04;
-const time_out: usize = 0x08;
-const width: usize = 0x0C;
 const blksz: usize = 0x10;
 const bytecnt: usize = 0x14;
 pub const cmd: usize = 0x18;
 pub const arg: usize = 0x1C;
-const intmask: usize = 0x30;
 pub const rint: usize = 0x38;
 pub const status: usize = 0x3C;
-const dbgc: usize = 0x50;
-const csdc: usize = 0x54;
 const ntsr: usize = 0x5c;
-const hwrst: usize = 0x78;
-const thldc: usize = 0x100;
 const drv_dl: usize = 0x140;
-const fifo: usize = 0x200;
 
 bitflags! {
+    pub struct SunxiMmcRing:u32{
+        const SUNXI_MMC_RINT_RESP_ERROR		= (0x1 << 1);
+        const SUNXI_MMC_RINT_COMMAND_DONE	=	(0x1 << 2);
+        const SUNXI_MMC_RINT_DATA_OVER	=	(0x1 << 3);
+        const SUNXI_MMC_RINT_TX_DATA_REQUEST	=	(0x1 << 4);
+        const SUNXI_MMC_RINT_RX_DATA_REQUEST	=	(0x1 << 5);
+        const SUNXI_MMC_RINT_RESP_CRC_ERROR	=	(0x1 << 6);
+        const SUNXI_MMC_RINT_DATA_CRC_ERROR		=(0x1 << 7);
+        const SUNXI_MMC_RINT_RESP_TIMEOUT	=	(0x1 << 8);
+        const SUNXI_MMC_RINT_DATA_TIMEOUT	=	(0x1 << 9);
+        const SUNXI_MMC_RINT_VOLTAGE_CHANGE_DONE=	(0x1 << 10);
+        const SUNXI_MMC_RINT_FIFO_RUN_ERROR	=	(0x1 << 11);
+        const SUNXI_MMC_RINT_HARD_WARE_LOCKED	=	(0x1 << 12);
+        const SUNXI_MMC_RINT_START_BIT_ERROR	=	(0x1 << 13);
+        const SUNXI_MMC_RINT_AUTO_COMMAND_DONE=	(0x1 << 14);
+        const SUNXI_MMC_RINT_END_BIT_ERROR	=	(0x1 << 15);
+        const SUNXI_MMC_RINT_SDIO_INTERRUPT	=	(0x1 << 16);
+        const SUNXI_MMC_RINT_CARD_INSERT	=	(0x1 << 30);
+        const SUNXI_MMC_RINT_CARD_REMOVE	=	(0x1 << 31);
+        const SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT =
+            SunxiMmcRing::SUNXI_MMC_RINT_RESP_ERROR.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_RESP_CRC_ERROR.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_DATA_CRC_ERROR.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_RESP_TIMEOUT.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_DATA_TIMEOUT.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_VOLTAGE_CHANGE_DONE.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_FIFO_RUN_ERROR.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_HARD_WARE_LOCKED.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_START_BIT_ERROR.bits |
+            SunxiMmcRing::SUNXI_MMC_RINT_END_BIT_ERROR.bits;
+    }
     struct MmcResp:u32{
         const MMC_RSP_PRESENT = 1 << 0;
         const MMC_RSP_136     = 1 << 1;
@@ -51,23 +72,28 @@ bitflags! {
         const MMC_RSP_BUSY    = 1 << 3;
         const MMC_RSP_OPCODE  = 1 << 4;
         const MMC_RSP_NONE    = 0;
-        const MMC_RSP_R1      = MmcResp::MMC_RSP_PRESENT.bits
-            | MmcResp::MMC_RSP_CRC.bits
-            | MmcResp::MMC_RSP_OPCODE.bits;
-        const MMC_RSP_R1B     = MmcResp::MMC_RSP_PRESENT.bits
-            | MmcResp::MMC_RSP_CRC.bits
-            | MmcResp::MMC_RSP_OPCODE.bits
-            | MmcResp::MMC_RSP_BUSY.bits;
-        const MMC_RSP_R2      = MmcResp::MMC_RSP_PRESENT.bits
-            | MmcResp::MMC_RSP_136.bits
-            | MmcResp::MMC_RSP_CRC.bits;
+        const MMC_RSP_R1      =
+            MmcResp::MMC_RSP_PRESENT.bits |
+            MmcResp::MMC_RSP_CRC.bits |
+            MmcResp::MMC_RSP_OPCODE.bits;
+        const MMC_RSP_R1B     =
+            MmcResp::MMC_RSP_PRESENT.bits |
+            MmcResp::MMC_RSP_CRC.bits |
+            MmcResp::MMC_RSP_OPCODE.bits |
+            MmcResp::MMC_RSP_BUSY.bits;
+        const MMC_RSP_R2      =
+            MmcResp::MMC_RSP_PRESENT.bits |
+            MmcResp::MMC_RSP_136.bits |
+            MmcResp::MMC_RSP_CRC.bits;
         const MMC_RSP_R3      = MmcResp::MMC_RSP_PRESENT.bits;
-        const MMC_RSP_R6      = MmcResp::MMC_RSP_PRESENT.bits
-            | MmcResp::MMC_RSP_CRC.bits
-            | MmcResp::MMC_RSP_OPCODE.bits;
-        const MMC_RSP_R7      = MmcResp::MMC_RSP_PRESENT.bits
-            | MmcResp::MMC_RSP_CRC.bits
-            | MmcResp::MMC_RSP_OPCODE.bits;
+        const MMC_RSP_R6      =
+            MmcResp::MMC_RSP_PRESENT.bits |
+            MmcResp::MMC_RSP_CRC.bits |
+            MmcResp::MMC_RSP_OPCODE.bits;
+        const MMC_RSP_R7      =
+            MmcResp::MMC_RSP_PRESENT.bits |
+            MmcResp::MMC_RSP_CRC.bits |
+            MmcResp::MMC_RSP_OPCODE.bits;
     }
     struct MmcFlags:u32{
         const MMC_DATA_NONE  = 0;
@@ -125,18 +151,31 @@ macro_rules! print {
         _print(core::format_args!($($arg)*));
     });
 }
-
 pub struct MMC {
-    pub OCR: u32,
-    pub CID: [u32; 4],
-    pub CSD: [u32; 4],
-    pub RCA: u32,
-    pub SCR: [u32; 2],
+    pub ocr: u32,
+    pub cid: [u32; 4],
+    pub csd: [u32; 4],
+    pub rca: u32,
+    pub scr: [u32; 2],
     pub read_bl_len: u32,
     pub write_bl_len: u32,
-    pub tran_speed: u32
+    pub tran_speed: u32,
 }
-pub struct MMC_CMD {
+impl MMC {
+    pub fn new() -> Self {
+        MMC {
+            ocr: 0,
+            rca: 0,
+            cid: [0; 4],
+            csd: [0; 4],
+            scr: [0; 2],
+            read_bl_len: 0,
+            write_bl_len: 0,
+            tran_speed: 0,
+        }
+    }
+}
+pub struct MmcCmd {
     cmdidx: u32,
     cmdarg: u32,
     resptype: MmcResp,
@@ -145,22 +184,42 @@ pub struct MMC_CMD {
     flags: MmcFlags,
     blocks: u32,
     blocksize: u32,
+    shmc:SHMC
 }
-impl MMC_CMD {
+impl MmcCmd {
     pub fn new() -> Self {
-        Self{
+        Self {
             cmdidx: 0,
             cmdarg: 0,
-            resptype: MmcResp::MMC_RSP_R1,
-            resp0: [0;4],
+            resptype: MmcResp::MMC_RSP_NONE,
+            resp0: [0; 4],
             resp1: 0,
             flags: MmcFlags::MMC_DATA_NONE,
             blocks: 0,
             blocksize: 0,
+            shmc:unsafe{Peripherals::steal().shmc}
         }
     }
+    pub fn set_data(&mut self, data: usize) {
+        self.resp1 = data;
+    }
+
+    pub fn rint_wait(&self,done_flag:SunxiMmcRing,timeout_msecs:u64) {
+        let timeout = Timer.get_us() + timeout_msecs;
+        loop{
+            let status_bits =self.shmc.rint.read().bits();
+            if Timer.get_us() > timeout || 
+            status_bits & SunxiMmcRing::SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT.bits() != 0{
+                panic!("rint wait error 0x{:x} 0x{:x}  {} 0x{:x}",SunxiMmcRing::SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT.bits()&status_bits,status_bits,self.cmdidx,done_flag.bits);
+            }
+            if status_bits & done_flag.bits() != 0 {
+                break;
+            }
+        }
+    }
+
     pub unsafe fn send(&mut self, data: bool) {
-        println!("\n[CMD] SEND CMD {}", self.cmdidx & 0x3F);
+        info!("\n[CMD] SEND CMD {}", self.cmdidx & 0x3F);
         let mut cmdval = 0x8000_0000u32;
         /*
          * CMDREG
@@ -178,6 +237,9 @@ impl MMC_CMD {
          * CMD[21]      : Update clock
          * CMD[31]      : Load cmd
          */
+        if self.cmdidx == 0{
+            cmdval |= 1 << 15;
+        }
         if self.resptype.contains(MmcResp::MMC_RSP_PRESENT) {
             cmdval |= 1 << 6;
         }
@@ -206,6 +268,7 @@ impl MMC_CMD {
 
         write_reg(SHMC_BASE, arg, self.cmdarg);
         if !data {
+            info!("CMDIDX: 0x{:x}", self.cmdidx | cmdval);
             write_reg(SHMC_BASE, cmd, self.cmdidx | cmdval);
         }
 
@@ -217,33 +280,21 @@ impl MMC_CMD {
             );
             write_reg(SHMC_BASE, cmd, self.cmdidx | cmdval);
             self.trans_data_by_cpu();
-            println!("CMD: 0x{:x}", self.cmdidx | cmdval);
-            println!("GCTRL: 0x{:x}", read_reg::<u32>(SHMC_BASE, gctrl));
-            println!("CMD: 0x{:x}", read_reg::<u32>(SHMC_BASE, blksz));
-            println!("CMD: 0x{:x}", read_reg::<u32>(SHMC_BASE, bytecnt));
+            info!("CMD: 0x{:x}", self.cmdidx | cmdval);
+            info!("GCTRL: 0x{:x}", read_reg::<u32>(SHMC_BASE, gctrl));
+            info!("CMD: 0x{:x}", read_reg::<u32>(SHMC_BASE, blksz));
+            info!("CMD: 0x{:x}", read_reg::<u32>(SHMC_BASE, bytecnt));
+            // Timer.mdelay(10);
         }
-        loop {
-            if read_reg::<u32>(SHMC_BASE, rint) & 0x4 != 0 {
-                break;
-            }
-        }
+        
+        self.rint_wait(SunxiMmcRing::SUNXI_MMC_RINT_COMMAND_DONE, 0xffffff);
+
         if data {
-            let mut done;
-            loop {
-                let staval = read_reg::<u32>(SHMC_BASE, rint);
-                if staval & 0xbbc2 != 0 {
-                    println!("timeout 0x{:x}", staval);
-                    return;
-                }
-                done = if self.blocks > 1 {
-                    staval & (1 << 14)
-                } else {
-                    staval & (1 << 3)
-                };
-                if done != 0 {
-                    break;
-                }
-            }
+            self.rint_wait(match self.blocks > 1{
+                    true => SunxiMmcRing::SUNXI_MMC_RINT_AUTO_COMMAND_DONE,
+                    false => SunxiMmcRing::SUNXI_MMC_RINT_DATA_OVER,
+                }, 
+                0xffff)
         }
         if self.resptype.bits & MmcResp::MMC_RSP_BUSY.bits != 0 {
             let timeout = crate::peripheral::Timer.get_us() + 0x4ffffff;
@@ -264,15 +315,17 @@ impl MMC_CMD {
         } else {
             self.resp0[0] = read_reg::<u32>(SHMC_BASE, 0x20);
         }
-        println!("SHMC_RINT:   0x{:x}", read_reg::<u32>(SHMC_BASE, rint));
-        write_reg(SHMC_BASE, rint, 0xFFFFFFFFu32);
-        read_reg::<u32>(SHMC_BASE, 0x20);
+        info!("SHMC_RINT:   0x{:x}", read_reg::<u32>(SHMC_BASE, rint));
+        self.shmc.rint.write(|w|w.bits(0xFFFFFFFF));
+        self.shmc.gctrl.write(|w|w.bits(self.shmc.gctrl.read().bits() | 2));
+        // warn!("{:x} {:x}",self.shmc.rint.read().bits(),self.shmc.gctrl.read().bits());
     }
     pub unsafe fn trans_data_by_cpu(&mut self) {
+        let shmc = Peripherals::steal().shmc;
         let mut timeout = crate::peripheral::Timer.get_us() + 0xffffff;
         let byte_cnt = (self.blocks * self.blocksize) as usize;
-        println!("bytecnt {:x}", byte_cnt >> 2);
-        println!("SHMC_status: 0x{:x}", read_reg::<u32>(SHMC_BASE, status));
+        info!("bytecnt {:x}", byte_cnt >> 2);
+        info!("SHMC_status: 0x{:x}", read_reg::<u32>(SHMC_BASE, status));
         let dst = self.resp1 as *mut u32;
         let status_bit = match self.flags {
             MmcFlags::MMC_DATA_READ => 1 << 2,
@@ -281,7 +334,7 @@ impl MMC_CMD {
         };
         for i in 0..(byte_cnt >> 2) {
             loop {
-                if read_reg::<u32>(SHMC_BASE, status) & status_bit == 0 {
+                if shmc.status.read().bits() & status_bit == 0 {
                     break;
                 }
                 if crate::peripheral::Timer.get_us() > timeout {
@@ -289,27 +342,28 @@ impl MMC_CMD {
                 }
             }
             match self.flags {
-                MmcFlags::MMC_DATA_READ => dst
-                    .offset(i as isize)
-                    .write(read_reg::<u32>(SHMC_BASE, fifo)),
-                MmcFlags::MMC_DATA_WRITE => {
-                    write_reg(SHMC_BASE, fifo, dst.offset(i as isize).read())
+                MmcFlags::MMC_DATA_READ => {
+                    dst.offset(i as isize)
+                        .write_volatile(shmc.fifo.read().bits());
                 }
-                _ => panic!("Error flag {:x}", self.flags),
+                MmcFlags::MMC_DATA_WRITE => {
+                    shmc.fifo
+                        .write(|w| w.bits(dst.offset(i as isize).read_volatile()));
+                }
+                _ => panic!("Error Data Flag {:x}", self.flags),
             }
             timeout = crate::peripheral::Timer.get_us() + 0xffffff;
         }
-        println!("SHMC_status: 0x{:x}", read_reg::<u32>(SHMC_BASE, status));
     }
     pub unsafe fn ptr2val<T>(&self, offset: isize) -> T {
-        (self.resp1 as *const T).offset(offset).read()
+        (self.resp1 as *const T).offset(offset).read_volatile()
     }
     pub unsafe fn read_block(&mut self, start: u32, blkcnt: u32) {
         self.cmdidx = match blkcnt {
             1 => 17,
             _ => 18,
         };
-        println!("CMDIDX: {}", self.cmdidx);
+        info!("CMDIDX: {} start: {}", self.cmdidx, start);
 
         self.resptype = MmcResp::MMC_RSP_R1;
         self.cmdarg = start;
@@ -317,8 +371,8 @@ impl MMC_CMD {
         self.blocksize = 512;
         self.flags = MmcFlags::MMC_DATA_READ;
         self.send(true);
-        println!("0x{:?}", self.resp1);
         self.print();
+
     }
     pub unsafe fn write_block(&mut self, start: u32, blkcnt: u32) {
         self.cmdidx = match blkcnt {
@@ -332,21 +386,22 @@ impl MMC_CMD {
         self.flags = MmcFlags::MMC_DATA_WRITE;
         self.send(true);
     }
+
     pub unsafe fn print(&self) {
-        println!("Count:0x{:x}", self.blocks * self.blocksize * 4);
+        info!("Count:0x{:x}", self.blocks * self.blocksize * 4);
         let index = self.resp1 as *mut u8;
         for i in 0..(self.blocks * self.blocksize) as isize {
             print!("0x{:<02x}, ", index.offset(i).read());
             if (i + 1) % 16 == 0 {
-                println!("");
+                print!("\r\n");
             }
         }
     }
 
     pub unsafe fn printinfo(&self) {
-        println!("SHMC STATUS: 0x{:x}", read_reg::<u32>(SHMC_BASE, 0x3C));
-        println!("SHMC CMD:    0x{:x}", read_reg::<u32>(SHMC_BASE, cmd));
-        println!(
+        info!("SHMC STATUS: 0x{:x}", read_reg::<u32>(SHMC_BASE, 0x3C));
+        info!("SHMC CMD:    0x{:x}", read_reg::<u32>(SHMC_BASE, cmd));
+        info!(
             "RESPONSES:   [0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}]",
             self.resp0[0], self.resp0[1], self.resp0[2], self.resp0[3]
         );
@@ -354,7 +409,7 @@ impl MMC_CMD {
     pub unsafe fn clear(&mut self) {
         self.resp0.iter_mut().for_each(|f| *f = 0);
 
-        println!("Count:0x{:x}", self.blocks * self.blocksize * 4);
+        info!("Count:0x{:x}", self.blocks * self.blocksize * 4);
         for i in 0..(self.blocks * self.blocksize) as usize {
             *((self.resp1 + i) as *mut u8) = 0;
         }
@@ -393,7 +448,7 @@ pub unsafe fn mmc_updata_clk() {
     write_reg(SHMC_BASE, rint, 0xFFFFFFFFu32);
 }
 pub unsafe fn mmc_get_clock() -> u32 {
-    let rval = read_reg::<u32>(mclkbase, 0);
+    let rval = read_reg::<u32>(MCLKBASE, 0);
     let m = rval & 0xf;
     let n = (rval >> 8) & 0x3;
     let src = (rval >> 24) & 0x3;
@@ -416,7 +471,7 @@ pub unsafe fn mmc_set_clock(clock: u32) {
     mmc_updata_clk();
 
     /* disable mclk */
-    write_reg(mclkbase, 0, 0u32);
+    write_reg(MCLKBASE, 0, 0u32);
     let rval = read_reg::<u32>(SHMC_BASE, ntsr) | (1 << 31);
     write_reg(SHMC_BASE, ntsr, rval);
 
@@ -450,10 +505,10 @@ pub unsafe fn mmc_set_clock(clock: u32) {
         m = div;
     }
 
-    write_reg(mclkbase, 0, (src << 24) | (n << 8) | (m - 1));
+    write_reg(MCLKBASE, 0, (src << 24) | (n << 8) | (m - 1));
 
     /* re-enable mclk */
-    write_reg(mclkbase, 0, read_reg::<u32>(mclkbase, 0) | (1u32 << 31));
+    write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1u32 << 31));
     let rval = read_reg::<u32>(SHMC_BASE, clkcr) & !(0xff);
     write_reg(SHMC_BASE, clkcr, rval);
 
@@ -465,9 +520,9 @@ pub unsafe fn mmc_set_clock(clock: u32) {
     let sdly = 0;
     let mut rval = read_reg::<u32>(SHMC_BASE, drv_dl) & !(0x3 << 16);
     rval |= ((odly & 0x1) << 16) | ((odly & 0x1) << 17);
-    write_reg(mclkbase, 0, read_reg::<u32>(mclkbase, 0) & !(1 << 31));
+    write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) & !(1 << 31));
     write_reg(SHMC_BASE, drv_dl, rval);
-    write_reg(mclkbase, 0, read_reg::<u32>(mclkbase, 0) | (1 << 31));
+    write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1 << 31));
     let mut rval = read_reg::<u32>(SHMC_BASE, ntsr);
     rval &= !(0x3 << 4);
     rval |= (sdly & 0x30) << 4;
@@ -493,10 +548,9 @@ unsafe fn gpio_init() {
     write_reg(GPIO_BASE, PF_DRV0, drv);
     let pull = read_reg::<u32>(GPIO_BASE, PF_PULL0) & 0x11111000 | 0x555;
     write_reg(GPIO_BASE, PF_PULL0, pull);
-    println!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
-    println!("DAT: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DAT));
-    println!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
-    println!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
+    info!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
+    info!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
+    info!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
 }
 
 unsafe fn __mmc_be32_to_cpu(x: u32) -> u32 {
@@ -507,15 +561,12 @@ unsafe fn __mmc_be32_to_cpu(x: u32) -> u32 {
 }
 
 pub(crate) unsafe fn mmc_core_init() {
-    let shmc = Peripherals::steal().SHMC;
+    let shmc = Peripherals::steal().shmc;
     // step 1
-    let rval = read_reg::<u32>(hclkbase, 0) | (1u32 << 16);
-    write_reg(hclkbase, 0, rval);
+    write_reg(HCLKBASE, 0, 0x10000);
     crate::peripheral::Timer.mdelay(1);
-    let rval = read_reg::<u32>(hclkbase, 0) | (1u32);
-    write_reg(hclkbase, 0, rval);
-    let rval = (1u32 << 31) | (2 << 8) | 14;
-    write_reg(mclkbase, 0, rval);
+    write_reg(HCLKBASE, 0, read_reg::<u32>(HCLKBASE, 0) | (1u32));
+    write_reg(MCLKBASE, 0, (1u32 << 31) | (2 << 8) | 14);
     shmc.thldc
         .write(|w| w.bits((512 << 16) | (1u32 << 2) | (1 << 0)));
 
@@ -545,38 +596,21 @@ pub(crate) unsafe fn mmc_core_init() {
     crate::peripheral::Timer.mdelay(1);
     shmc.clkcr
         .write(|w| w.bits(shmc.clkcr.read().bits() & !(0x1 << 31)));
-    shmc.timeout.write(|w| w.bits(0xFFFFFFFFu32));
+    //shmc.timeout.write(|w| w.bits(0xffffff << 8 | 0xFF));
 
     let rval = read_reg::<u32>(SHMC_BASE, gctrl) & !(1u32 << 10);
 
-    write_reg(mclkbase, 0, read_reg::<u32>(mclkbase, 0) & !(1 << 31));
+    write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) & !(1 << 31));
     write_reg(SHMC_BASE, gctrl, rval);
-    write_reg(mclkbase, 0, read_reg::<u32>(mclkbase, 0) | (1 << 31));
+    write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1 << 31));
     // step4
 
     // 0 -> 8 -> 55, 41 -> 2 ? -> 3 -> 9 -> 7 ->55, 6 -> 9 -> 13 -> 7
-    let buf = [0u32; 128 * 4];
+    let buf = [0u8; 512];
 
-    let mut cmdtmp = MMC_CMD {
-        cmdidx: 0x8000_8000u32,
-        cmdarg: 0,
-        resptype: MmcResp::MMC_RSP_NONE,
-        resp0: [0; 4],
-        flags: MmcFlags::MMC_DATA_NONE,
-        resp1: buf.as_ptr() as usize,
-        blocks: 0,
-        blocksize: 0,
-    };
-    let mut mmc = MMC {
-        OCR: 0,
-        RCA: 0,
-        CID: [0; 4],
-        CSD: [0; 4],
-        SCR: [0; 2],
-        read_bl_len: 0,
-        write_bl_len: 0,
-        tran_speed: 0
-    };
+    let mut cmdtmp = MmcCmd::new();
+    cmdtmp.set_data(buf.as_ptr() as *const _ as usize);
+    let mut mmc = MMC::new();
     cmdtmp.send(false);
 
     cmdtmp.cmdidx = 8;
@@ -597,7 +631,7 @@ pub(crate) unsafe fn mmc_core_init() {
             break;
         }
     }
-    mmc.OCR = cmdtmp.resp0[0];
+    mmc.ocr = cmdtmp.resp0[0];
 
     // mmc_startup
     /* Put the Card in Identify Mode */
@@ -606,39 +640,41 @@ pub(crate) unsafe fn mmc_core_init() {
     cmdtmp.resptype = MmcResp::MMC_RSP_R2;
     cmdtmp.send(false);
     cmdtmp.printinfo();
-    mmc.CID = cmdtmp.resp0;
+    mmc.cid = cmdtmp.resp0;
     cmdtmp.clear();
     /*
-	 * For MMC cards, set the Relative Address.
-	 * For SD cards, get the Relatvie Address.
-	 * This also puts the cards into Standby State
-	 */
+     * For MMC cards, set the Relative Address.
+     * For SD cards, get the Relatvie Address.
+     * This also puts the cards into Standby State
+     */
     cmdtmp.cmdidx = 3;
     cmdtmp.cmdarg = 0;
     cmdtmp.resptype = MmcResp::MMC_RSP_R6;
     cmdtmp.send(false);
     cmdtmp.printinfo();
-    mmc.RCA = cmdtmp.resp0[0] >> 16 & 0xFFFF;
+    mmc.rca = cmdtmp.resp0[0] >> 16 & 0xFFFF;
     cmdtmp.clear();
 
     /* Get the Card-Specific Data */
     cmdtmp.cmdidx = 9;
-    cmdtmp.cmdarg = mmc.RCA << 16;
+    cmdtmp.cmdarg = mmc.rca << 16;
     cmdtmp.resptype = MmcResp::MMC_RSP_R2;
     cmdtmp.send(false);
     cmdtmp.printinfo();
-    mmc.CSD = cmdtmp.resp0;
+    mmc.csd = cmdtmp.resp0;
     let frep = [10000, 100000, 1000000, 10000000][(cmdtmp.resp0[0] & 0x7) as usize];
-    let mult = [0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80][((cmdtmp.resp0[0] >> 3) & 0x7) as usize];
-    mmc.read_bl_len = (mmc.CSD[1] >> 16) & 0xf;
+    let mult = [
+        0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80,
+    ][((cmdtmp.resp0[0] >> 3) & 0x7) as usize];
+    mmc.read_bl_len = 1 << ((mmc.csd[1] >> 16) & 0xf);
     mmc.write_bl_len = mmc.read_bl_len;
     mmc.tran_speed = frep * mult;
-    println!("read_bl_len: 0x{:x}", (mmc.CSD[1] >> 16) & 0xf);
+
     cmdtmp.clear();
 
     /* Waiting for the ready status */
     cmdtmp.cmdidx = 13;
-    cmdtmp.cmdarg = mmc.RCA << 16;
+    cmdtmp.cmdarg = mmc.rca << 16;
     cmdtmp.resptype = MmcResp::MMC_RSP_R1;
     loop {
         cmdtmp.send(false);
@@ -655,17 +691,16 @@ pub(crate) unsafe fn mmc_core_init() {
 
     /* Select the card, and put it into Transfer Mode */
     cmdtmp.cmdidx = 7;
-    cmdtmp.cmdarg = mmc.RCA << 16;
+    cmdtmp.cmdarg = mmc.rca << 16;
     cmdtmp.resptype = MmcResp::MMC_RSP_R1B;
     cmdtmp.send(false);
     cmdtmp.printinfo();
     mmc_set_clock(25000000);
     crate::peripheral::Timer.mdelay(1000);
 
-
     // /* change freq */
     cmdtmp.cmdidx = 55;
-    cmdtmp.cmdarg = mmc.RCA << 16;
+    cmdtmp.cmdarg = mmc.rca << 16;
     cmdtmp.resptype = MmcResp::MMC_RSP_R1;
     cmdtmp.clear();
     cmdtmp.send(false);
@@ -677,15 +712,15 @@ pub(crate) unsafe fn mmc_core_init() {
     cmdtmp.blocksize = 8;
     cmdtmp.flags = MmcFlags::MMC_DATA_READ;
     cmdtmp.send(true);
-    mmc.SCR[0] = __mmc_be32_to_cpu(cmdtmp.ptr2val::<u32>(0));
-    mmc.SCR[1] = __mmc_be32_to_cpu(cmdtmp.ptr2val::<u32>(1));
+    mmc.scr[0] = __mmc_be32_to_cpu(cmdtmp.ptr2val::<u32>(0));
+    mmc.scr[1] = __mmc_be32_to_cpu(cmdtmp.ptr2val::<u32>(1));
 
-    if mmc.SCR[0] & 0x40000 != 0 {
-        println!("MMC_MODE_BIT 0x{:x}", mmc.SCR[0]);
+    if mmc.scr[0] & 0x40000 != 0 {
+        info!("MMC_MODE_BIT 0x{:x}", mmc.scr[0]);
     }
 
-    println!("Version： {}", (mmc.SCR[0] >> 24) & 0xf);
-    println!("MODEBIT:  0x{:x} 0x{:x}", mmc.SCR[0] & 0x40000, mmc.SCR[0]);
+    info!("Version： {}", (mmc.scr[0] >> 24) & 0xf);
+    info!("MODEBIT:  0x{:x} 0x{:x}", mmc.scr[0] & 0x40000, mmc.scr[0]);
 
     for _ in 0..4 {
         cmdtmp.cmdidx = 6;
@@ -693,14 +728,13 @@ pub(crate) unsafe fn mmc_core_init() {
         cmdtmp.cmdarg = 0 << 31 | 0xffffff;
         cmdtmp.cmdarg &= !(0xf << (0 * 4));
         cmdtmp.cmdarg |= 1 << (0 * 4);
-
         cmdtmp.blocks = 1;
         cmdtmp.blocksize = 64;
         cmdtmp.flags = MmcFlags::MMC_DATA_READ;
         cmdtmp.send(true);
-        println!("0x{:?}", cmdtmp.resp1);
-        println!("{:?}", cmdtmp.resp0);
-        println!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
+        info!("0x{:?}", cmdtmp.resp1);
+        info!("{:?}", cmdtmp.resp0);
+        info!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
         cmdtmp.print();
         if cmdtmp.ptr2val::<u32>(16) & 0xF == 1 {
             break;
@@ -716,81 +750,78 @@ pub(crate) unsafe fn mmc_core_init() {
     cmdtmp.blocksize = 64;
     cmdtmp.flags = MmcFlags::MMC_DATA_READ;
     cmdtmp.send(true);
-    println!("0x{:?}", cmdtmp.resp1);
-    println!("{:?}", cmdtmp.resp0);
-    println!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
+    info!("0x{:?}", cmdtmp.resp1);
+    info!("{:?}", cmdtmp.resp0);
+    info!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
     cmdtmp.print();
-    println!("Ret： 0x{:x}", cmdtmp.ptr2val::<u8>(16));
-    if cmdtmp.ptr2val::<u8>(16) != 1 {
+    info!("Ret： 0x{:x}", cmdtmp.ptr2val::<u8>(16));
+    if cmdtmp.ptr2val::<u8>(16) & 0xf != 1 {
         panic!("Make China Great Again!")
     }
 
     mmc_updata_clk();
 
-    println!("Ret： 0x{:x}", cmdtmp.ptr2val::<u8>(16));
-    println!("Ret： 0x{:x}", cmdtmp.ptr2val::<u32>(4));
-
     // set bus width
-    cmdtmp.cmdidx = 55;
-    cmdtmp.resptype = MmcResp::MMC_RSP_R1;
-    cmdtmp.cmdarg = mmc.RCA << 16;
-    cmdtmp.send(false);
+    // cmdtmp.cmdidx = 55;
+    // cmdtmp.resptype = MmcResp::MMC_RSP_R1;
+    // cmdtmp.cmdarg = mmc.RCA << 16;
+    // cmdtmp.send(false);
 
-    cmdtmp.cmdidx = 6;
-    cmdtmp.resptype = MmcResp::MMC_RSP_R1;
-    cmdtmp.cmdarg = 0;
-    cmdtmp.send(false);
+    // cmdtmp.cmdidx = 6;
+    // cmdtmp.resptype = MmcResp::MMC_RSP_R1;
+    // cmdtmp.cmdarg = 0;
+    // cmdtmp.send(false);
 
-    let ind = cmdtmp.resp1 as * mut u32;
-    for i in 0isize..128{
-        ind.offset(i).write(0x43997a7a)
+    let ind = cmdtmp.resp1 as *mut u32;
+    for i in 0isize..128 {
+        ind.offset(i).write(0x41424344)
     }
-    for i in 128isize..256{
-        ind.offset(i).write(0xbbbbbbbb)
-    }
-    // //singal sector test
-    // {
-    //     cmdtmp.write_block(0, 1);
-    //     cmdtmp.read_block(0, 1);
+    println!(
+        "cmdtmp： 0x{} 0x{}",
+        cmdtmp.resp1,
+        buf.as_ptr() as *const _ as usize
+    );
+    // for i in 128isize..256{
+    //     ind.offset(i).write(0xbbbbbbbb)
     // }
+    // //singal sector test
+    {
+        cmdtmp.write_block(0, 1);
+        cmdtmp.read_block(0, 1);
+    }
+
+    {
+        cmdtmp.write_block(0, 1);
+        Timer.mdelay(10);
+        cmdtmp.read_block(0, 1);
+    }
     // // mutlty sector test
     // {
     //     cmdtmp.write_block(0,2);
     //     cmdtmp.write_block(2,2);
     //     cmdtmp.read_block(0, 4);
     // }
-    
+
     {
-        cmdtmp.read_block(32832, 1);
+        cmdtmp.write_block(100, 1);
+        cmdtmp.read_block(100, 1);
     }
 
-    println!("\n\n\n=======================================");
-    println!("SHMC_THLDC: 0x{:x}", shmc.thldc.read().bits());
-    println!("SHMC_BGR_REG: 0x{:x}", read_reg::<u32>(hclkbase, 0));
-    println!("SHMC_CLK_REG: 0x{:x}", read_reg::<u32>(mclkbase, 0));
-    println!("SHMC_GCTRL:   0x{:x}", read_reg::<u32>(SHMC_BASE, gctrl));
-    println!("SHMC_CLKCR:   0x{:x}", read_reg::<u32>(SHMC_BASE, clkcr));
-    println!("Source: {}", _get_pll_periph0() * 2 * 1000000);
-    println!("clock: {}", mmc_get_clock());
-    println!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
-    println!("DAT: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DAT));
-    println!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
-    println!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
-
-    // let vol = Volume::new(Card);
-    // drop(buf);
-    // let mut root = vol.root_dir();
-    // root.create_file("carefile").unwrap();
-    // let mut file = root.open_file("carefile").unwrap();
-    // file.write(&[0x40u8; 10], fat32::file::WriteType::Append)
-    //     .unwrap();
-    // let mut buf = [0u8; 128];
-    // println!("Origin {:?}", buf);
-    // file.read(&mut buf).unwrap();
-    // println!("{:?}", buf);
+    info!("\n\n\n=======================================");
+    info!("SHMC_THLDC: 0x{:x}", shmc.thldc.read().bits());
+    info!("SHMC_BGR_REG: 0x{:x}", read_reg::<u32>(HCLKBASE, 0));
+    info!("SHMC_CLK_REG: 0x{:x}", read_reg::<u32>(MCLKBASE, 0));
+    info!("SHMC_GCTRL:   0x{:x}", read_reg::<u32>(SHMC_BASE, gctrl));
+    info!("SHMC_CLKCR:   0x{:x}", read_reg::<u32>(SHMC_BASE, clkcr));
+    info!("Source: {}", _get_pll_periph0() * 2 * 1000000);
+    info!("clock: {}", mmc_get_clock());
+    info!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
+    info!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
+    info!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
 }
 
 pub unsafe fn mmc_init_test() {
+    init().unwrap();
     gpio_init();
     mmc_core_init();
 }
@@ -831,16 +862,6 @@ mod generic {
         U: Copy,
     {
         #[inline(always)]
-        pub fn reset(&self) {
-            self.register.set(Self::reset_value())
-        }
-    }
-    impl<U, REG> Reg<U, REG>
-    where
-        Self: ResetValue<Type = U> + Writable,
-        U: Copy,
-    {
-        #[inline(always)]
         pub fn write<F>(&self, f: F)
         where
             F: FnOnce(&mut W<U, Self>) -> &mut W<U, Self>,
@@ -854,51 +875,6 @@ mod generic {
             );
         }
     }
-    impl<U, REG> Reg<U, REG>
-    where
-        Self: Writable,
-        U: Copy + Default,
-    {
-        #[inline(always)]
-        pub fn write_with_zero<F>(&self, f: F)
-        where
-            F: FnOnce(&mut W<U, Self>) -> &mut W<U, Self>,
-        {
-            self.register.set(
-                f(&mut W {
-                    bits: U::default(),
-                    _reg: marker::PhantomData,
-                })
-                .bits,
-            );
-        }
-    }
-    impl<U, REG> Reg<U, REG>
-    where
-        Self: Readable + Writable,
-        U: Copy,
-    {
-        #[inline(always)]
-        pub fn modify<F>(&self, f: F)
-        where
-            for<'w> F: FnOnce(&R<U, Self>, &'w mut W<U, Self>) -> &'w mut W<U, Self>,
-        {
-            let bits = self.register.get();
-            self.register.set(
-                f(
-                    &R {
-                        bits,
-                        _reg: marker::PhantomData,
-                    },
-                    &mut W {
-                        bits,
-                        _reg: marker::PhantomData,
-                    },
-                )
-                .bits,
-            );
-        }
-    }
     pub struct R<U, T> {
         pub(crate) bits: U,
         _reg: marker::PhantomData<T>,
@@ -907,14 +883,6 @@ mod generic {
     where
         U: Copy,
     {
-        ///Create new instance of reader
-        #[inline(always)]
-        pub(crate) fn new(bits: U) -> Self {
-            Self {
-                bits,
-                _reg: marker::PhantomData,
-            }
-        }
         ///Read raw bits from register/field
         #[inline(always)]
         pub fn bits(&self) -> U {
@@ -931,23 +899,7 @@ mod generic {
             self.bits.eq(&(*other).into())
         }
     }
-    impl<FI> R<bool, FI> {
-        ///Value of the field as raw bits
-        #[inline(always)]
-        pub fn bit(&self) -> bool {
-            self.bits
-        }
-        ///Returns `true` if the bit is clear (0)
-        #[inline(always)]
-        pub fn bit_is_clear(&self) -> bool {
-            !self.bit()
-        }
-        ///Returns `true` if the bit is set (1)
-        #[inline(always)]
-        pub fn bit_is_set(&self) -> bool {
-            self.bit()
-        }
-    }
+
     pub struct W<U, REG> {
         ///Writable bits
         pub(crate) bits: U,
@@ -962,13 +914,6 @@ mod generic {
         }
     }
     ///Used if enumerated values cover not the whole range
-    #[derive(Clone, Copy, PartialEq)]
-    pub enum Variant<U, T> {
-        ///Expected variant
-        Val(T),
-        ///Raw bits
-        Res(U),
-    }
 
     pub struct SHMC {
         _marker: PhantomData<*const ()>,
@@ -1043,26 +988,21 @@ mod generic {
             use crate::generic::ResetValue;
 
             use super::Register;
-
-            pub type R = crate::generic::R<u32, super::Register>;
-            pub type W = crate::generic::W<u32, super::Register>;
             impl ResetValue for Register {
                 type Type = u32;
                 fn reset_value() -> Self::Type {
                     0
                 }
             }
-            impl R {}
-            impl W {}
         }
     }
     pub struct Peripherals {
-        pub SHMC: SHMC,
+        pub shmc: SHMC,
     }
     impl Peripherals {
         pub unsafe fn steal() -> Self {
             Peripherals {
-                SHMC: SHMC {
+                shmc: SHMC {
                     _marker: PhantomData,
                 },
             }
@@ -1152,27 +1092,55 @@ mod serial {
     }
 }
 
-pub struct Card{
-    pub cmd:MMC_CMD
+pub struct Card {
+    pub cmd: MmcCmd,
 }
 lazy_static::lazy_static! {
-    pub static ref SD_CARD:Mutex<Option<Box<Card>>> = Mutex::new(Some(Box::new(Card { cmd: MMC_CMD::new() })));
+    pub static ref SD_CARD:Mutex<Option<Box<Card>>> = Mutex::new(Some(Box::new(Card { cmd: MmcCmd::new() })));
 }
 
-impl Card{
-    pub fn read_blocks(&mut self, start: u32, blkcnt: u32,buf: &[u8]){
+impl Card {
+    pub fn read_blocks(&mut self, start: u32, blkcnt: u32, buf: &[u8]) {
         self.cmd.resp1 = buf.as_ptr() as *const _ as usize;
-        unsafe{
+        unsafe {
             self.cmd.read_block(start, blkcnt);
         }
-        
     }
-    pub fn write_blocks(&mut self, start: u32, blkcnt: u32,buf: &[u8]){
+    pub fn write_blocks(&mut self, start: u32, blkcnt: u32, buf: &[u8]) {
         self.cmd.resp1 = buf.as_ptr() as *const _ as usize;
-        unsafe{
+        unsafe {
             self.cmd.write_block(start, blkcnt);
         }
     }
+}
+
+use log::{info, warn, Level, LevelFilter, Metadata, Record, SetLoggerError};
+struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= Level::Info
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!("{} - {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
+pub fn init() -> Result<(), SetLoggerError> {
+    log::set_logger(&LOGGER).map(|()| {
+        log::set_max_level(match option_env!("LOG").unwrap() {
+            "info" => LevelFilter::Info,
+            "warn" => LevelFilter::Warn,
+            _ => LevelFilter::Warn,
+        })
+    })
 }
 
 #[cfg(test)]
