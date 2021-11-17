@@ -2,10 +2,11 @@
 name = "nezha_sdc"
 version = "0.1.0"
 edition = "2018"
+authors = ["ez4yunfeng2<ez4yunfeng2@stu.hunau.edu.cn>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-LOG = []
+iotest = []
 
 [dependencies]
 log = "0.4.14"

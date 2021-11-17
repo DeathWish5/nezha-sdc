@@ -7,9 +7,8 @@ use crate::{
 };
 use alloc::{boxed::Box, string::String};
 use bitflags::bitflags;
-use generic::{SHMC};
-
-use core::{fmt};
+use generic::SHMC;
+use core::fmt;
 use embedded_hal::prelude::_embedded_hal_serial_Write;
 use peripheral::Timer;
 use serial::Serial;
@@ -18,19 +17,8 @@ const GPIO_BASE: usize = 0x02000000;
 const PF_CFG0: usize = 0xF0;
 const PF_DRV0: usize = 0x104;
 const PF_PULL0: usize = 0x114;
-
 const HCLKBASE: usize = 0x2001000 + 0x84c;
 const MCLKBASE: usize = 0x2001000 + 0x830;
-
-pub const SHMC_BASE: usize = 0x04020000;
-const gctrl: usize = 0x0;
-const clkcr: usize = 0x04;
-pub const cmd: usize = 0x18;
-pub const arg: usize = 0x1C;
-pub const rint: usize = 0x38;
-pub const status: usize = 0x3C;
-const ntsr: usize = 0x5c;
-const drv_dl: usize = 0x140;
 
 bitflags! {
     pub struct SunxiMmcRing:u32{
@@ -110,7 +98,7 @@ bitflags! {
 lazy_static::lazy_static! {
     static ref LEGACY_STDIO: Mutex<Option<Box<Serial>>> =
         Mutex::new(Some(Box::new(Serial::new(0x0250_0000))));
-        static ref rca:Mutex<u32> = Mutex::new(0);
+        static ref RCA:Mutex<u32> = Mutex::new(0);
 }
 struct Stdout;
 
@@ -228,7 +216,6 @@ impl MmcHost {
                 return Err(SdError(String::from("rint time out")));
             }
             if status_bits & SunxiMmcRing::SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT.bits() != 0 {
-                warn!("Cmd: {} 0x{:x} 0x{:x}",self.cmdidx, status_bits,done_flag);
                 self.error_recover();
                 return Err(SdError(String::from("rint error")));
             }
@@ -301,11 +288,7 @@ impl MmcHost {
                 cmdval &= !(1 << 13);
             }
         }
-        if self.cmdidx == 13{
-            warn!("Send_Status: {:x} {:x}",self.cmdidx | cmdval,self.cmdarg);
-        }
-        
-        write_reg(SHMC_BASE, arg, self.cmdarg);
+        self.shmc.arg.write(|w|w.bits(self.cmdarg));
         if !data {
             println!("CMDIDX: 0x{:x}", self.cmdidx | cmdval);
             
@@ -402,20 +385,21 @@ impl MmcHost {
         // Timer.mdelay(10);
         self.cmdidx = 13;
         self.resptype = MmcResp::MMC_RSP_R1;
-        self.cmdarg = *rca.lock() << 16;
-        warn!("{} {} {}",self.cmdidx,self.cmdarg,self.rca);
-        for _ in 0..4{
-            warn!("{} {}",self.cmdidx,self.cmdarg);
+        self.cmdarg = *RCA.lock() << 16;
+        let mut retries = 10;
+        loop {
             if let Ok(_) = self.send(false) {
                 if self.resp0[0] & 1 << 8 != 0 && self.resp0[0] & (0xf << 9) != 7 << 9 {
                     return Ok(());
                 }
             } else {
-                Timer.udelay(1000)
+                retries = retries - 1;
+                if retries < 0{
+                    return Err(SdError(String::from("Sdcard Busy")))
+                }
             }
-            
+            Timer.udelay(1000)
         }
-        Err(SdError(String::from("Sdcard Busy")))
     }
     pub unsafe fn read_block(&mut self, start: u32, blkcnt: u32) {
         self.cmdidx = match blkcnt {
@@ -506,29 +490,22 @@ pub unsafe fn mmc_clk_io_onoff(onoff:bool,clk:u32){
     }
 }
 pub unsafe fn mmc_updata_clk() -> Result<(),SdError>{
-    let timeout = crate::peripheral::Timer.get_us() + 0xfffff;
-    write_reg(
-        SHMC_BASE,
-        clkcr,
-        read_reg::<u32>(SHMC_BASE, clkcr) | (1 << 31),
-    );
-    write_reg(SHMC_BASE, cmd, (1u32 << 31) | (1 << 21) | (1 << 13));
+    let shmc = Peripherals::steal().shmc;
+    let timeout = Timer.get_us() + 0xfffff;
+    shmc.clkcr.write(|w|w.bits(shmc.clkcr.read().bits() | (1 << 31)));
+    shmc.cmd.write(|w|w.bits((1u32 << 31) | (1 << 21) | (1 << 13)));
     loop {
-        if read_reg::<u32>(SHMC_BASE, cmd) & 0x8000_0000u32 == 0
-            && crate::peripheral::Timer.get_us() < timeout
+        if shmc.cmd.read().bits() & 0x8000_0000u32 == 0
+            && Timer.get_us() < timeout
         {
             break;
         }
     }
-    if read_reg::<u32>(SHMC_BASE, cmd) & 0x8000_0000u32 != 0 {
+    if shmc.cmd.read().bits()  & 0x8000_0000u32 != 0 {
         return Err(SdError(String::from("update clock fail")));
     }
-    write_reg(
-        SHMC_BASE,
-        clkcr,
-        read_reg::<u32>(SHMC_BASE, clkcr) & !(1 << 31),
-    );
-    write_reg(SHMC_BASE, rint, 0xFFFFFFFFu32);
+    shmc.clkcr.write(|w|w.bits(shmc.clkcr.read().bits() & !(1 << 31),));
+    shmc.rint.write(|w|w.bits(0xFFFFFFFFu32));
     Ok(())
 }
 pub unsafe fn mmc_get_clock() -> u32 {
@@ -547,18 +524,16 @@ pub unsafe fn mmc_get_clock() -> u32 {
     sclk_hz / (1 << n) / (m + 1)
 }
 pub unsafe fn mmc_set_clock(clock: u32) {
+    let shmc = Peripherals::steal().shmc;
     /* disable card clock */
-    let rval = read_reg::<u32>(SHMC_BASE, clkcr) & !(1 << 16);
-    write_reg(SHMC_BASE, clkcr, rval);
-
+    let rval = shmc.clkcr.read().bits() & !(1 << 16);
+    shmc.clkcr.write(|w|w.bits(rval));
     /* updata clock */
     mmc_updata_clk().unwrap();
 
     /* disable mclk */
     write_reg(MCLKBASE, 0, 0u32);
-    let rval = read_reg::<u32>(SHMC_BASE, ntsr) | (1 << 31);
-    write_reg(SHMC_BASE, ntsr, rval);
-
+    shmc.ntsr.write(|w|w.bits(shmc.ntsr.read().bits() | (1 << 31)));
     let src: u32;
     let sclk_hz: u32;
     if clock <= 4000000 {
@@ -593,30 +568,25 @@ pub unsafe fn mmc_set_clock(clock: u32) {
 
     /* re-enable mclk */
     write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1u32 << 31));
-    let rval = read_reg::<u32>(SHMC_BASE, clkcr) & !(0xff);
-    write_reg(SHMC_BASE, clkcr, rval);
-
+    shmc.clkcr.write(|w|w.bits(shmc.clkcr.read().bits()& !(0xff)));
     /* update clock */
     mmc_updata_clk().unwrap();
 
     /* config delay */
     let odly = 0;
     let sdly = 0;
-    let mut rval = read_reg::<u32>(SHMC_BASE, drv_dl) & !(0x3 << 16);
+    let mut rval = shmc.drv_dl.read().bits();
     rval |= ((odly & 0x1) << 16) | ((odly & 0x1) << 17);
     write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) & !(1 << 31));
-    write_reg(SHMC_BASE, drv_dl, rval);
+    shmc.drv_dl.write(|w|w.bits(rval));
     write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1 << 31));
-    let mut rval = read_reg::<u32>(SHMC_BASE, ntsr);
+
+    let mut rval = shmc.ntsr.read().bits(); 
     rval &= !(0x3 << 4);
     rval |= (sdly & 0x30) << 4;
-    write_reg(SHMC_BASE, ntsr, rval);
+    shmc.ntsr.write(|w|w.bits(rval));
     /* Re-enable card clock */
-    write_reg(
-        SHMC_BASE,
-        clkcr,
-        read_reg::<u32>(SHMC_BASE, clkcr) | (0x1 << 16),
-    );
+    shmc.clkcr.write(|w|w.bits(shmc.clkcr.read().bits() | (0x1 << 16)));
     /* update clock */
     mmc_updata_clk().unwrap();
 }
@@ -632,9 +602,6 @@ unsafe fn gpio_init() {
     write_reg(GPIO_BASE, PF_DRV0, drv);
     let pull = read_reg::<u32>(GPIO_BASE, PF_PULL0) & 0x11111000 | 0x555;
     write_reg(GPIO_BASE, PF_PULL0, pull);
-    println!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
-    println!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
-    println!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
 }
 
 unsafe fn __mmc_be32_to_cpu(x: u32) -> u32 {
@@ -680,12 +647,9 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
     crate::peripheral::Timer.mdelay(1);
     shmc.clkcr
         .write(|w| w.bits(shmc.clkcr.read().bits() & !(0x1 << 31)));
-    //shmc.timeout.write(|w| w.bits(0xffffff << 8 | 0xFF));
-
-    let rval = read_reg::<u32>(SHMC_BASE, gctrl) & !(1u32 << 10);
-
+    let rval = shmc.gctrl.read().bits() & !(1u32 << 10);
     write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) & !(1 << 31));
-    write_reg(SHMC_BASE, gctrl, rval);
+    shmc.gctrl.write(|w|w.bits(rval));
     write_reg(MCLKBASE, 0, read_reg::<u32>(MCLKBASE, 0) | (1 << 31));
     // step4
 
@@ -736,9 +700,8 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
     cmdtmp.send(false).unwrap();
     cmdtmp.printinfo();
     mmc.rca = cmdtmp.resp0[0] >> 16 & 0xFFFF;
-    *rca.lock() = mmc.rca;
+    *RCA.lock() = mmc.rca;
     cmdtmp.rca = mmc.rca;
-    warn!("RCA: {}",cmdtmp.rca);
     cmdtmp.clear();
 
     /* Get the Card-Specific Data */
@@ -760,7 +723,7 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
 
     /* Waiting for the ready status */
     cmdtmp.cmdidx = 13;
-    cmdtmp.cmdarg = *rca.lock() << 16;
+    cmdtmp.cmdarg = *RCA.lock() << 16;
     cmdtmp.resptype = MmcResp::MMC_RSP_R1;
     loop {
         cmdtmp.send(false).unwrap();
@@ -804,10 +767,6 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
     if mmc.scr[0] & 0x40000 != 0 {
         println!("MMC_MODE_BIT 0x{:x}", mmc.scr[0]);
     }
-
-    println!("Version： {}", (mmc.scr[0] >> 24) & 0xf);
-    println!("MODEBIT:  0x{:x} 0x{:x}", mmc.scr[0] & 0x40000, mmc.scr[0]);
-
     for _ in 0..4 {
         cmdtmp.cmdidx = 6;
         cmdtmp.resptype = MmcResp::MMC_RSP_R1;
@@ -818,10 +777,6 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
         cmdtmp.blocksize = 64;
         cmdtmp.flags = MmcFlags::MMC_DATA_READ;
         cmdtmp.send(true).unwrap();
-        println!("0x{:?}", cmdtmp.resp1);
-        println!("{:?}", cmdtmp.resp0);
-        println!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
-        //cmdtmp.print();
         if cmdtmp.ptr2val::<u32>(16) & 0xF == 1 {
             break;
         }
@@ -836,60 +791,43 @@ pub(crate) unsafe fn mmc_core_init() -> Result<(),SdError>{
     cmdtmp.blocksize = 64;
     cmdtmp.flags = MmcFlags::MMC_DATA_READ;
     cmdtmp.send(true).unwrap();
-    println!("0x{:?}", cmdtmp.resp1);
-    println!("{:?}", cmdtmp.resp0);
-    println!("[CMDARG] 0x{:x}", cmdtmp.cmdarg);
-    //mdtmp.print();
-    println!("Ret： 0x{:x}", cmdtmp.ptr2val::<u8>(16));
     if cmdtmp.ptr2val::<u8>(16) & 0xf != 1 {
         return Err(SdError(String::from("sdcard busy")));
     }
 
     mmc_updata_clk().unwrap();
 
-    // let ind = cmdtmp.resp1 as *mut u32;
-    // for i in 0isize..128 {
-    //     ind.offset(i).write(0x41424344)
-    // }
-    // for i in 128isize..256{
-    //     ind.offset(i).write(0xbbbbbbbb)
-    // }
-    // // //singal sector test
-    // {
-    //     cmdtmp.write_block(0, 1);
-    //     cmdtmp.read_block(0, 1);
-    // }
-
-    // // mutlty sector test
-    // {
-    //     cmdtmp.write_block(0,2);
-    //     cmdtmp.write_block(2,2);
-    //     cmdtmp.read_block(0, 4);
-    // }
-
-    // for _ in 0..10{
-    //     cmdtmp.write_block(100, 1);
-    //     cmdtmp.read_block(100, 1);
-    // }
-    
-    println!("\n\n\n=======================================");
-    println!("SHMC_THLDC: 0x{:x}", shmc.thldc.read().bits());
-    println!("SHMC_BGR_REG: 0x{:x}", read_reg::<u32>(HCLKBASE, 0));
-    println!("SHMC_CLK_REG: 0x{:x}", read_reg::<u32>(MCLKBASE, 0));
-    println!("SHMC_GCTRL:   0x{:x}", read_reg::<u32>(SHMC_BASE, gctrl));
-    println!("SHMC_CLKCR:   0x{:x}", read_reg::<u32>(SHMC_BASE, clkcr));
-    println!("Source: {}", _get_pll_periph0() * 2 * 1000000);
-    println!("clock: {}", mmc_get_clock());
-    println!("CFG: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_CFG0));
-    println!("DRV: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_DRV0));
-    println!("PUL: 0x{:x}", read_reg::<u32>(GPIO_BASE, PF_PULL0));
-
+    #[cfg(feature="iotest")]
+    {
+        let ind = cmdtmp.resp1 as *mut u32;
+        for i in 0isize..128 {
+            ind.offset(i).write(0x41424344)
+        }
+        for i in 128isize..256{
+            ind.offset(i).write(0xABCDEF)
+        }
+        {
+            cmdtmp.write_block(0, 1);
+            cmdtmp.read_block(0, 1);
+        }
+        {
+            cmdtmp.write_block(0,2);
+            cmdtmp.write_block(2,2);
+            cmdtmp.read_block(0, 4);
+        }
+        for _ in 0..10{
+            cmdtmp.write_block(100, 1);
+            cmdtmp.read_block(100, 1);
+        }
+    }
     Ok(())
 }
 
-pub unsafe fn mmc_init_test() {
-    gpio_init();
-    mmc_core_init().unwrap();
+pub fn sdcard_init() {
+    unsafe {
+        gpio_init();
+        mmc_core_init().unwrap();
+    }
 }
 mod generic {
     use core::marker;
@@ -897,11 +835,8 @@ mod generic {
     use core::ops::Deref;
     pub trait Readable {}
     pub trait Writable {}
-
     pub trait ResetValue {
-        ///Register size
         type Type;
-        ///Reset value of the register
         fn reset_value() -> Self::Type;
     }
     pub struct Reg<U, REG> {
@@ -949,7 +884,6 @@ mod generic {
     where
         U: Copy,
     {
-        ///Read raw bits from register/field
         #[inline(always)]
         pub fn bits(&self) -> U {
             self.bits
@@ -965,23 +899,17 @@ mod generic {
             self.bits.eq(&(*other).into())
         }
     }
-
     pub struct W<U, REG> {
-        ///Writable bits
         pub(crate) bits: U,
         _reg: marker::PhantomData<REG>,
     }
     impl<U, REG> W<U, REG> {
-        ///Writes raw bits to the register
         #[inline(always)]
         pub unsafe fn bits(&mut self, bits: U) -> &mut Self {
             self.bits = bits;
             self
         }
-    }
-    ///Used if enumerated values cover not the whole range
-
-    pub struct SHMC {
+    }    pub struct SHMC {
         _marker: PhantomData<*const ()>,
     }
     unsafe impl Send for SHMC {}
@@ -1161,9 +1089,11 @@ mod serial {
 
 #[cfg(test)]
 mod tests {
+    use crate::sdcard_init;
+
     #[test]
     fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
+        sdcard_init();
+        
     }
 }
