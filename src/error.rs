@@ -5,14 +5,21 @@ pub type SdResult<T = ()> = Result<T, SdError>;
 #[repr(isize)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SdError {
+    // Hardware Error
     RintTimeout = 0,
-    RintError = 1,
-    MMCSendTimeout = 2,
-    TranslateDataTimeout = 3,
-    WrongDataFlag = 4,
-    SdcardBusy = 5,
-    UpdateClockFail = 6,
-    MMCStatusError = 7,
+    RintError,
+    MMCSendTimeout,
+    TranslateDataTimeout,
+    WrongDataFlag,
+    SdcardBusy,
+    UpdateClockFail,
+    MMCStatusError,
+    DmaTimeout,
+    DmaError,
+    // Software Error
+    Unsupported,
+    InvalidParam,
+    Unknown,
 }
 
 impl fmt::Display for SdError {
@@ -27,6 +34,11 @@ impl fmt::Display for SdError {
             SdcardBusy => "Sdcard busy",
             UpdateClockFail => "Update Clock fail",
             MMCStatusError => "MMC status error",
+            DmaTimeout => "Dma timeout",
+            DmaError => "Dma error",
+            Unsupported => "Not supported yet",
+            InvalidParam => "Invalid parameters",
+            Unknown => "Unknown error",
         };
         write!(f, "{}", explain)
     }
