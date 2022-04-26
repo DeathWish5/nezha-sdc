@@ -56,6 +56,16 @@ impl MmcHost {
         inner.shmc.csdc.write(3);
         inner.shmc.dbgc.write(0xdeb);
 
+	// Enable Interrupts
+	inner.shmc.gctrl.modify(|x| x | GctrlReg::GINT_ENABLE.bits());
+	inner.shmc.imask.write(0xc001ffceu32); // Enable many types of Interrupt
+	/* DMA Interrupts
+	inner.shmc.dmac.write(0x82);
+	inner.shmc.idie.write(0x37);
+	*/
+	inner.shmc.rint.write(0xffffffffu32); // Reset interrupt status bits
+
+	// release eMMC reset signal
         inner.shmc.hwrst.write(1);
         inner.shmc.hwrst.write(0);
         Timer.mdelay(1);
@@ -272,8 +282,8 @@ impl MmcHost {
     pub fn handle_irq(&self) {
         info!("------ sdcard interrupt happended! ----------");
         // let inner = self.inner.lock();
-        info!(
-            "Int Reg = {:x}",
+        error!(
+            "Handle SDCard is not implemented !\n Int Reg = {:x}",
             read_reg::<u32>(SHMC0_BASE_ADDR, SHMC_RINT)
         );
     }
@@ -366,12 +376,12 @@ impl MmcHostInner {
             debug!("CMDIDX: 0x{:x}", config.cmdidx.raw() | cmdval.bits());
             self.shmc.cmd.write(config.cmdidx.raw() | cmdval.bits());
         }
-        let imask = self.shmc.imask.read();
+        let mint = self.shmc.mint.read();
         let idie = self.shmc.idie.read();
         info!(
-            "send STEP1 intr = {} imask = {:x} idie = {:x}",
+            "send STEP1 intr = {} maskedINT = {:x} idie = {:x}",
             intr_get(),
-            imask,
+            mint,
             idie
         );
         // loop {
@@ -425,11 +435,12 @@ impl MmcHostInner {
         // clear idst idie dmac, gctrl.dma_enbale
         let idst = self.shmc.idst.read();
         self.shmc.idst.write(idst);
-        self.shmc.idie.write(0);
+        self.shmc.idie.write(0); // DMA Interrupt
         self.shmc.dmac.write(0);
         self.shmc
             .gctrl
             .modify(|x| x & (!GctrlReg::DMA_ENABLE.bits()));
+	// TODO, AHB bus (rw data through CPU) OR DMA bus
 
         debug!("send SHMC_RINT:   0x{:x}", self.shmc.rint.read());
         self.shmc.rint.write(IntMask::ALL.bits());
@@ -561,6 +572,7 @@ impl MmcHostInner {
     pub fn reset(&mut self) {
         self.shmc.gctrl.write(GctrlReg::RESET_ALL.bits());
         polling_reg_clear!(self.shmc.gctrl, GctrlReg::RESET_ALL);
+	self.shmc.gctrl.modify(|x| x | GctrlReg::GINT_ENABLE.bits());
         // self.update_clock().unwrap();
         self.shmc.rint.write(IntMask::ALL.bits());
     }
@@ -590,7 +602,7 @@ impl MmcHostInner {
         //         DmaIntMaskReg::RINT_ENABLE.bits()
         //     }
         // });
-        self.shmc.idie.write(0xFFFF);
+        self.shmc.idie.write(0xFFFF); //DMA Interrupt
         debug!("DMA STEP5 {:x}", des_phys_addr);
         if (des_phys_addr & 0x3) != 0 {
             error!("DES should be 4 bytes aligned!");
@@ -711,7 +723,8 @@ impl MmcHostInner {
         // self.shmc
         //     .imask
         //     .write((IntMask::SDIO_INTERRUPT | IntMask::DEFAULT_MASK).bits());
-        self.shmc.imask.write(0xFFFFFFFF);
+        //self.shmc.imask.write(0xFFFFFFFF);
+
         self.shmc
             .clkcr
             .modify(|x| x | ClkCtrlReg::CLK_ENABLE.bits() | ClkCtrlReg::MASK_DATA0.bits()); // enable clk
